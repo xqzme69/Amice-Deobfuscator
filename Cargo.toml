@@ -1,0 +1,18 @@
+[package]
+name = "amice-devirt"
+version = "0.1.0"
+edition = "2024"
+description = "Static PE64 and LLVM IR devirtualizer for fuqiuluo/amice"
+license = "MIT"
+repository = "https://github.com/xqzme69/Amice-Deobfuscator"
+keywords = ["llvm", "devirtualizer", "deobfuscation", "reverse-engineering", "amice"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+amice-vm = { git = "https://github.com/fuqiuluo/amice", rev = "2c019b01679717657e820c9220342a0a19f214a9" }
+anyhow = "1.0"
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info"] }
+object = { version = "0.40", default-features = false, features = ["read", "std"] }
+pdb = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
