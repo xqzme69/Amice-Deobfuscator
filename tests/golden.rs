@@ -7,6 +7,49 @@ use amice_devirt::strings::{StringAlgorithm, StringDecodeOptions, recover_string
 use amice_vm::ProfilePackage;
 use std::{fs, path::PathBuf, process::Command};
 
+#[test]
+fn recovers_simd_tail_stored_from_the_low_xmm_lane() {
+    let report = recover_pe64_strings(include_bytes!("fixtures/narrow-simd.exe")).unwrap();
+    assert_eq!(report.algorithm, Some(StringAlgorithm::SimdXor));
+    for expected in ["hello", "static gang"] {
+        assert!(
+            report
+                .strings
+                .iter()
+                .any(|s| s.text.as_deref() == Some(expected) && s.nul_terminated)
+        );
+    }
+}
+
+#[test]
+fn recovers_beta_2_wide_strings_from_ir_and_pe() {
+    let module =
+        amice_devirt::llvm_ir::parse_ll_module(include_str!("fixtures/wide-simd.ll")).unwrap();
+    let ir = recover_strings(&module, &StringDecodeOptions::default()).unwrap();
+    let pe = recover_pe64_strings(include_bytes!("fixtures/wide-simd.exe")).unwrap();
+    for report in [ir, pe] {
+        assert_eq!(report.algorithm, Some(StringAlgorithm::SimdXor));
+        assert_eq!(report.strings.len(), 2);
+        for (text, encoding, hex) in [
+            ("WideΩ😀", "utf-16le", "5700690064006500a9033dd800de0000"),
+            (
+                "UTF32😀",
+                "utf-32le",
+                "550000005400000046000000330000003200000000f6010000000000",
+            ),
+        ] {
+            let string = report
+                .strings
+                .iter()
+                .find(|s| s.text.as_deref() == Some(text))
+                .unwrap();
+            assert_eq!(string.encoding, Some(encoding));
+            assert_eq!(string.plaintext_hex, hex);
+            assert!(string.nul_terminated);
+        }
+    }
+}
+
 fn work_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()

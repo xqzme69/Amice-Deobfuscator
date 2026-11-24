@@ -292,10 +292,14 @@ fn auto_decode_pe(pe_path: &Path) -> Result<()> {
 fn load_auto_profiles(pe_path: &Path) -> Result<Vec<PeProfile>> {
     let mut profiles = load_pe_profiles(Vec::new())?;
     for path in auto_profile_paths(pe_path) {
-        match load_profile(Some(path.display().to_string())) {
-            Ok((package, name)) => {
+        match read_verified_profile(&path) {
+            Ok((_, true)) => continue, // already covered by the built-in simple decoder
+            Ok((package, false)) => {
                 if profiles.iter().all(|profile| profile.package != package) {
-                    profiles.push(PeProfile { name, package });
+                    profiles.push(PeProfile {
+                        name: path.display().to_string(),
+                        package,
+                    });
                 }
             }
             Err(err) => println!("[!] Skipped profile {}: {err:#}", path.display()),
@@ -659,19 +663,57 @@ fn parse_global_list(value: &str) -> Result<Vec<String>> {
 }
 
 fn load_profile(path: Option<String>) -> Result<(ProfilePackage, String)> {
-    let (profile, name) = if let Some(path) = path {
+    if let Some(path) = path {
         let path = PathBuf::from(path);
-        let profile = ProfilePackage::load_from_path(&path)
+        let (profile, _) = read_verified_profile(&path)
             .with_context(|| format!("load profile {}", path.display()))?;
-        (profile, path.display().to_string())
-    } else {
-        (
-            ProfilePackage::builtin_test().context("load built-in amice-simple-vmp profile")?,
-            "built-in amice-simple-vmp".to_owned(),
-        )
-    };
+        return Ok((profile, path.display().to_string()));
+    }
+    let profile =
+        ProfilePackage::builtin_test().context("load built-in amice-simple-vmp profile")?;
     verify_profile(&profile).context("verify VMP profile")?;
-    Ok((profile, name))
+    Ok((profile, "built-in amice-simple-vmp".to_owned()))
+}
+
+fn read_verified_profile(path: &Path) -> Result<(ProfilePackage, bool)> {
+    let read = |name: &str| {
+        let file = path.join(name);
+        fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))
+    };
+    let manifest_text = read("manifest.toml")?;
+    let manifest: amice_vm::profile::Manifest = toml::from_str(&manifest_text)?;
+    let files = &manifest.profile;
+    let abi = read(&files.abi)?;
+    let isa = read(&files.isa)?;
+    let lowering = read(&files.lowering)?;
+    let bytecode = read(&files.bytecode)?;
+    let decoder = read(&files.decoder)?;
+    let runtime = read(&files.runtime)?;
+    let profile = ProfilePackage::from_sources(
+        manifest, &abi, &isa, &lowering, &bytecode, &decoder, &runtime,
+    )?;
+    if let Err(current_error) = verify_profile(&profile) {
+        // Older packages predate four mandatory atomic handlers. Validate the
+        // same source snapshot with their verifier before accepting one.
+        let legacy = amice_vm_legacy::ProfilePackage::from_sources(
+            toml::from_str(&manifest_text)?,
+            &abi,
+            &isa,
+            &lowering,
+            &bytecode,
+            &decoder,
+            &runtime,
+        )
+        .and_then(|legacy| {
+            amice_vm_legacy::verify::verify_profile(&legacy)?;
+            Ok(legacy == amice_vm_legacy::ProfilePackage::builtin_test()?)
+        });
+        let legacy_builtin = legacy.with_context(|| {
+            format!("verify VMP profile ({current_error}); legacy verification also failed")
+        })?;
+        return Ok((profile, legacy_builtin));
+    }
+    Ok((profile, false))
 }
 
 fn load_pe_profiles(paths: Vec<String>) -> Result<Vec<PeProfile>> {
@@ -813,9 +855,11 @@ fn optional_arg(args: &[String], name: &str) -> Option<String> {
 }
 
 fn option_values(args: &[String], name: &str) -> Vec<String> {
-    args.chunks_exact(2)
-        .filter(|pair| pair[0] == name)
-        .map(|pair| pair[1].to_owned())
+    let (pairs, _) = args.as_chunks::<2>();
+    pairs
+        .iter()
+        .filter(|[key, _]| key == name)
+        .map(|[_, value]| value.to_owned())
         .collect()
 }
 

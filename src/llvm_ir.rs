@@ -15,6 +15,7 @@ pub struct ByteGlobal {
 pub struct ByteLiteralGlobal {
     pub name: String,
     pub literal_index: usize,
+    pub element_bytes: usize,
     pub len: usize,
     pub bytes: Vec<u8>,
     pub section: Option<String>,
@@ -167,7 +168,7 @@ fn parse_direct_callee(line: &str) -> Option<String> {
     parse_at_name(&line[call + 5..])
 }
 
-fn parse_at_name(text: &str) -> Option<String> {
+pub(crate) fn parse_at_name(text: &str) -> Option<String> {
     parse_at_name_with_len(text).map(|(name, _)| name)
 }
 
@@ -227,19 +228,29 @@ fn parse_array_len(line: &str, element: &str) -> Option<usize> {
 }
 
 fn parse_byte_global(line: &str) -> Result<Option<ByteGlobal>> {
-    let Some(len) = parse_array_len(line, "i8") else {
+    let Some((_, definition)) = line.split_once(" = ") else {
         return Ok(None);
     };
-    let Some(c_pos) = line.find(" c\"") else {
+    let Some((prefix, array)) = definition.split_once('[') else {
+        return Ok(None);
+    };
+    if !matches!(
+        prefix.split_whitespace().last(),
+        Some("global" | "constant")
+    ) {
+        return Ok(None);
+    }
+    let Some((len, value)) = array.split_once(" x i8] c") else {
+        return Ok(None);
+    };
+    let Ok(len) = len.parse::<usize>() else {
         return Ok(None);
     };
     let name = parse_global_name(line).context("byte global without name")?;
-    let bytes = parse_llvm_c_string(&line[c_pos + 2..])?;
+    let bytes = parse_llvm_c_string(value)?;
     if bytes.len() != len {
         bail!(
-            "{} declares {} bytes but literal decoded to {}",
-            name,
-            len,
+            "{name} declares {len} bytes but literal decoded to {}",
             bytes.len()
         );
     }
@@ -257,50 +268,77 @@ fn parse_byte_literals(line: &str) -> Result<Vec<ByteLiteralGlobal>> {
     };
     let section = parse_section(line)?;
     let mut literals = Vec::new();
-    let mut cursor = 0;
-
-    while let Some(relative_c) = line[cursor..].find(" c\"") {
-        let c_pos = cursor + relative_c;
-        let before = &line[..c_pos];
-        let Some(type_end) = before.rfind(']') else {
-            cursor = c_pos + 2;
+    let mut rest = line;
+    while let Some(pos) = rest.find(['[', '"', ';']) {
+        rest = &rest[pos..];
+        if rest.starts_with(';') {
+            break;
+        }
+        if rest.starts_with('"') {
+            rest = &rest[llvm_c_string_len(rest)?..];
+            continue;
+        }
+        rest = &rest[1..];
+        let Some((ty, after)) = rest.split_once(']') else {
+            break;
+        };
+        let Some((count, kind)) = ty.split_once(" x ") else {
             continue;
         };
-        let Some(type_start) = before[..type_end].rfind('[') else {
-            cursor = c_pos + 2;
+        let Ok(count) = count.parse::<usize>() else {
             continue;
         };
-        let array_type = before[type_start + 1..type_end].trim();
-        let Some(len_text) = array_type.strip_suffix(" x i8") else {
-            cursor = c_pos + 2;
-            continue;
+        let value = after.trim_start();
+        let (element_bytes, bytes) = match kind {
+            "i8" if value.starts_with("c\"") => {
+                let bytes = parse_llvm_c_string(&value[1..])?;
+                rest = &value[1 + llvm_c_string_len(&value[1..])?..];
+                (1, bytes)
+            }
+            "i16" | "i32" if value.starts_with('[') => {
+                let Some((items, tail)) = value[1..].split_once(']') else {
+                    continue;
+                };
+                let width = if kind == "i16" { 2 } else { 4 };
+                let Some(bytes) = wide_array_bytes(items, kind, width) else {
+                    continue;
+                };
+                rest = tail;
+                (width, bytes)
+            }
+            _ => continue,
         };
-        let len = len_text
-            .trim()
-            .parse::<usize>()
-            .with_context(|| format!("invalid byte array length in {name}"))?;
-        let literal_start = c_pos + 2;
-        let bytes = parse_llvm_c_string(&line[literal_start..])?;
-        if bytes.len() != len {
+        if bytes.len() / element_bytes != count {
             bail!(
-                "{} byte literal {} declares {} bytes but decoded to {}",
-                name,
+                "{name} literal {} declares {count} {kind} elements but decoded to {}",
                 literals.len(),
-                len,
-                bytes.len()
+                bytes.len() / element_bytes
             );
         }
         literals.push(ByteLiteralGlobal {
             name: name.clone(),
             literal_index: literals.len(),
-            len,
+            element_bytes,
+            len: bytes.len(),
             bytes,
             section: section.clone(),
         });
-        cursor = literal_start + llvm_c_string_len(&line[literal_start..])?;
     }
-
     Ok(literals)
+}
+
+fn wide_array_bytes(items: &str, kind: &str, width: usize) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    for item in items.split(',') {
+        let (ty, number) = item.trim().split_once(' ')?;
+        let word = number.parse::<i64>().ok()?;
+        let bits = width * 8;
+        if ty != kind || !(-(1_i64 << (bits - 1))..(1_i64 << bits)).contains(&word) {
+            return None;
+        }
+        bytes.extend_from_slice(&word.to_le_bytes()[..width]);
+    }
+    Some(bytes)
 }
 
 fn parse_section(line: &str) -> Result<Option<String>> {

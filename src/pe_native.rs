@@ -170,7 +170,8 @@ pub(crate) fn apply_symbol_names(report: &mut DecodeReport, symbols: &PeSymbolMa
 fn runtime_function_ranges(sections: &[SectionView<'_>], image_base: u64) -> Vec<(u64, u64)> {
     let mut ranges = Vec::new();
     for section in sections.iter().filter(|section| section.name == ".pdata") {
-        for entry in section.data.chunks_exact(12) {
+        let (entries, _) = section.data.as_chunks::<12>();
+        for entry in entries {
             let begin = u32::from_le_bytes(entry[0..4].try_into().expect("four-byte RVA"));
             let end = u32::from_le_bytes(entry[4..8].try_into().expect("four-byte RVA"));
             if begin < end {

@@ -6,7 +6,9 @@ the decoder follows Amice's descriptor, bytecode, profile, runtime, native thunk
 
 ## install
 
-build it directly from source:
+for Windows x64, download [amice-devirt.exe](https://github.com/xqzme69/Amice-Deobfuscator/releases/download/v0.2.0/amice-devirt.exe).
+
+to build from source, run
 
 ```bash
 git clone https://github.com/xqzme69/Amice-Deobfuscator.git
@@ -58,6 +60,7 @@ auto mode loads every package it finds there. if a valid descriptor table belong
 - guard-checked descriptor, bytecode, const pool, and native table decoding
 - native thunk, import, export, indirect-call table, and optional PDB resolution
 - XOR and SIMD XOR strings in `global`, `lazy`, `stack`, and `inline` modes
+- UTF-16LE and UTF-32LE literals, including wide fields in LLVM struct initializers
 - Rust, C, and C++ protected output
 - readable listings, JSON records, PE locations, and honest pseudo-lift coverage
 
@@ -156,7 +159,9 @@ a custom Amice VMP profile is required to decode that profile because its opcode
 
 `lift.ll.txt` is a reverse-engineering aid, not rebuilt source or a full SSA decompiler. unknown profile semantics remain visible as `vm_unknown` and are counted in `lift-coverage.json`.
 
-the source contract is pinned to Amice [`2c019b0`](https://github.com/fuqiuluo/amice/commit/2c019b01679717657e820c9220342a0a19f214a9), tagged `v0.1.5-beta.3`. format changes in a later Amice revision need to be checked against that revision's source before updating the pin.
+amice-devirt 0.2.0 targets Amice `v0.1.6-beta.2`. the built-in simple profile also recognizes the 16 opcode aliases retired since `v0.1.5-beta.3`. for older custom profiles, pass the package that produced the input. [Amice release](https://github.com/fuqiuluo/amice/releases/tag/v0.1.6-beta.2)
+
+typed IR gives the decoder the width of each string element. PE data and optimized byte buffers can lose that type. the decoder marks a wide string inferred from its byte pattern with `inferred_wide_code_units` in `strings.json`. this heuristic needs two leading printable ASCII code units, at least one more character, and an aligned terminator. use the typed IR when those clues are missing.
 
 use it on your own or otherwise authorized artifacts.
 

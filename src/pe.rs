@@ -554,10 +554,8 @@ fn find_descriptor_tables<'a>(
                 fields.push(next);
                 cursor += row_len;
             }
-            let words = section.data[*offset..*offset + fields.len() * row_len]
-                .chunks_exact(8)
-                .map(read_u64)
-                .collect();
+            let (chunks, _) = section.data[*offset..*offset + fields.len() * row_len].as_chunks();
+            let words = chunks.iter().copied().map(u64::from_le_bytes).collect();
             candidates.push(DescriptorCandidate {
                 seed: *seed,
                 section: *section,
@@ -572,7 +570,11 @@ fn find_descriptor_tables<'a>(
 
 fn descriptor_word(data: &[u8], row_offset: usize, field_index: usize) -> u64 {
     let start = row_offset + field_index * 8;
-    read_u64(&data[start..start + 8])
+    u64::from_le_bytes(
+        *data[start..]
+            .first_chunk()
+            .expect("eight-byte descriptor word"),
+    )
 }
 
 fn descriptor_row(
@@ -582,7 +584,12 @@ fn descriptor_row(
     fn_index: usize,
 ) -> Option<DescriptorFields> {
     let bytes = data.get(offset..offset + DESCRIPTOR_FIELD_COUNT * 8)?;
-    let words = bytes.chunks_exact(8).map(read_u64).collect::<Vec<_>>();
+    let (chunks, _) = bytes.as_chunks();
+    let words = chunks
+        .iter()
+        .copied()
+        .map(u64::from_le_bytes)
+        .collect::<Vec<_>>();
     decrypt_descriptor_words(seed, fn_index, &words)
 }
 
@@ -695,9 +702,11 @@ fn find_native_tables<'a>(
             continue;
         }
         for offset in (0..=section.data.len() - byte_len).step_by(8) {
-            let targets = section.data[offset..offset + byte_len]
-                .chunks_exact(8)
-                .map(read_u64)
+            let (chunks, _) = section.data[offset..offset + byte_len].as_chunks();
+            let targets = chunks
+                .iter()
+                .copied()
+                .map(u64::from_le_bytes)
                 .collect::<Vec<_>>();
             if targets
                 .iter()
@@ -804,7 +813,8 @@ fn reachable_data_references(
 fn pe_function_ranges(sections: &[SectionView<'_>], image_base: u64) -> Vec<(u64, u64)> {
     let mut ranges = Vec::new();
     for section in sections.iter().filter(|section| section.name == ".pdata") {
-        for entry in section.data.chunks_exact(12) {
+        let (entries, _) = section.data.as_chunks::<12>();
+        for entry in entries {
             let begin = u32::from_le_bytes(entry[0..4].try_into().expect("four-byte RVA"));
             let end = u32::from_le_bytes(entry[4..8].try_into().expect("four-byte RVA"));
             if begin < end {
@@ -939,10 +949,6 @@ fn image_layout_report(
             })
             .collect(),
     }
-}
-
-fn read_u64(bytes: &[u8]) -> u64 {
-    u64::from_le_bytes(bytes.try_into().expect("slice length is eight bytes"))
 }
 
 #[cfg(test)]

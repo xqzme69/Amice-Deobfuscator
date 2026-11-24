@@ -1,7 +1,12 @@
 use crate::pe::SectionView;
-use crate::strings::{RecoveredString, StringAlgorithm, StringReport, recovered_bytes};
+use crate::strings::{
+    RecoveredString, StringAlgorithm, StringReport, recovered_bytes, wide_prefix,
+};
 use anyhow::{Result, bail};
-use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
+use iced_x86::{
+    Decoder, DecoderOptions, FlowControl, Instruction, InstructionInfoFactory, Mnemonic, OpAccess,
+    OpKind, Register,
+};
 use std::collections::{BTreeMap, HashMap};
 
 const XOR_KEY: u8 = 0xaa;
@@ -11,14 +16,6 @@ const MIN_PLAIN_LEN: usize = 4;
 struct KeyByte {
     key: u8,
     instruction_va: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RegisterByte {
-    address: u64,
-    key: Option<u8>,
-    instruction_va: u64,
-    age: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -72,8 +69,8 @@ pub(crate) fn recover_pe_strings(sections: &[SectionView<'_>]) -> Result<StringR
         });
     }
 
-    extend_fixed_xor_sections(sections, &mut keys)?;
     let algorithm = if keys.values().all(|entry| entry.key == XOR_KEY) {
+        extend_fixed_xor_sections(sections, &mut keys)?;
         StringAlgorithm::Xor
     } else {
         StringAlgorithm::SimdXor
@@ -303,9 +300,15 @@ fn recover_stack_containers(sections: &[SectionView<'_>]) -> Vec<RecoveredString
     for section in sections.iter().filter(|section| section.executable) {
         let mut decoder = Decoder::with_ip(64, section.data, section.address, DecoderOptions::NONE);
         let mut pending = HashMap::<Register, BTreeMap<i64, StackByte>>::new();
+        let mut info = InstructionInfoFactory::new();
+        let mut history = Vec::new();
         while decoder.can_decode() {
             let instruction = decoder.decode();
-            remember_stack_immediate(&instruction, &mut pending);
+            remember_stack_immediate(&instruction, &history, &mut info, sections, &mut pending);
+            if history.len() == 12 {
+                history.remove(0);
+            }
+            history.push(instruction);
             if stack_flush_boundary(&instruction) {
                 flush_stack_bytes(*section, &mut pending, &mut strings);
             }
@@ -317,11 +320,13 @@ fn recover_stack_containers(sections: &[SectionView<'_>]) -> Vec<RecoveredString
 
 fn remember_stack_immediate(
     instruction: &Instruction,
+    history: &[Instruction],
+    info: &mut InstructionInfoFactory,
+    sections: &[SectionView<'_>],
     pending: &mut HashMap<Register, BTreeMap<i64, StackByte>>,
 ) {
-    if instruction.mnemonic() != Mnemonic::Mov
+    if !copy_instruction(instruction)
         || instruction.op0_kind() != OpKind::Memory
-        || !is_immediate(instruction.op1_kind())
         || instruction.memory_index() != Register::None
     {
         return;
@@ -331,11 +336,38 @@ fn remember_stack_immediate(
         return;
     }
     let width = instruction.memory_size().size();
-    if !matches!(width, 1 | 2 | 4 | 8) {
+    let immediate;
+    let value = if is_immediate(instruction.op1_kind()) && width <= 8 {
+        immediate = instruction.immediate(1).to_le_bytes();
+        &immediate[..width]
+    } else if instruction.op1_kind() == OpKind::Register {
+        let reg = instruction.op1_register();
+        let Some((load, _)) = last_register_write(history, reg, info) else {
+            return;
+        };
+        if !copy_instruction(load) || load.op0_register() != reg {
+            return;
+        }
+        if is_immediate(load.op1_kind()) && width <= 8 {
+            immediate = load.immediate(1).to_le_bytes();
+            &immediate[..width]
+        } else if load.is_ip_rel_memory_operand() && load.memory_size().size() >= width {
+            let address = load.ip_rel_memory_address();
+            let Some(section) = sections
+                .iter()
+                .find(|s| !s.writable && !s.executable && contains_range(**s, address, width))
+            else {
+                return;
+            };
+            let offset = (address - section.address) as usize;
+            &section.data[offset..offset + width]
+        } else {
+            return;
+        }
+    } else {
         return;
-    }
+    };
     let displacement = instruction.memory_displacement64() as i64;
-    let value = instruction.immediate(1).to_le_bytes();
     let bytes = pending.entry(base).or_default();
     for (offset, byte) in value[..width].iter().copied().enumerate() {
         bytes.insert(
@@ -375,13 +407,42 @@ fn flush_stack_bytes(
         }
 
         for run in runs {
-            for nul in run
-                .iter()
-                .enumerate()
-                .filter_map(|(index, (_, byte))| (byte.value == 0).then_some(index))
-            {
+            let raw: Vec<_> = run.iter().map(|(_, b)| b.value).collect();
+            let mut cursor = 0;
+            while cursor < raw.len() {
+                if let Some((width, len)) = wide_prefix(&raw[cursor..]) {
+                    let slice = &raw[cursor..cursor + len];
+                    let (offset, byte) = run[cursor];
+                    let mut item = recovered_bytes(
+                        format!("pe.stack_{:016x}_{offset:x}", byte.instruction_va),
+                        strings.len(),
+                        Some(section.name.to_owned()),
+                        StringAlgorithm::Plain,
+                        slice,
+                        slice,
+                        vec![
+                            "amice_stack_container_x86_64".to_owned(),
+                            "inferred_wide_code_units".to_owned(),
+                            format!("base:{base:?}"),
+                            format!("stack_offset:{offset:+#x}"),
+                        ],
+                    );
+                    item.set_wide_text(slice, width);
+                    strings.push(item);
+                    cursor += len;
+                    continue;
+                }
+                let Some(nul) = raw[cursor..]
+                    .iter()
+                    .position(|b| *b == 0)
+                    .map(|n| n + cursor)
+                else {
+                    break;
+                };
+                let lower = cursor;
+                cursor = nul + 1;
                 let mut start = nul;
-                while start > 0 && plain_byte(run[start - 1].1.value) {
+                while start > lower && plain_byte(run[start - 1].1.value) {
                     start -= 1;
                 }
                 let body = &run[start..nul];
@@ -405,8 +466,8 @@ fn flush_stack_bytes(
                     strings.len(),
                     Some(section.name.to_owned()),
                     StringAlgorithm::Plain,
-                    plain.clone(),
-                    plain,
+                    &plain,
+                    &plain,
                     vec![
                         "amice_stack_container_x86_64".to_owned(),
                         format!("section:{}", section.name),
@@ -428,41 +489,31 @@ fn collect_key_bytes(
 ) -> Result<()> {
     let mut decoder = Decoder::with_ip(64, code.data, code.address, DecoderOptions::NONE);
     let mut address_registers = HashMap::<Register, (u64, usize)>::new();
-    let mut byte_registers = HashMap::<Register, RegisterByte>::new();
+    let mut info = InstructionInfoFactory::new();
     let mut instructions = Vec::new();
     while decoder.can_decode() {
         instructions.push(decoder.decode());
     }
 
     for (index, instruction) in instructions.iter().enumerate() {
-        age_registers(&mut address_registers, &mut byte_registers);
+        address_registers.retain(|_, (_, age)| {
+            *age += 1;
+            *age <= 16
+        });
         remember_address(instruction, &mut address_registers);
-        remember_loaded_byte(instruction, sections, &mut byte_registers);
-        remember_register_xor(instruction, &mut byte_registers);
-        remember_stored_byte(instruction, sections, &mut byte_registers, keys)?;
+        let history = &instructions[index.saturating_sub(12)..index];
+        recover_xor_store(instruction, history, &mut info, sections, keys)?;
         remember_memory_xor(
             instruction,
             &instructions[index + 1..instructions.len().min(index + 10)],
             sections,
             &address_registers,
+            history,
+            &mut info,
             keys,
         )?;
     }
     Ok(())
-}
-
-fn age_registers(
-    addresses: &mut HashMap<Register, (u64, usize)>,
-    bytes: &mut HashMap<Register, RegisterByte>,
-) {
-    addresses.retain(|_, (_, age)| {
-        *age += 1;
-        *age <= 16
-    });
-    bytes.retain(|_, value| {
-        value.age += 1;
-        value.age <= 8
-    });
 }
 
 fn remember_address(instruction: &Instruction, addresses: &mut HashMap<Register, (u64, usize)>) {
@@ -479,77 +530,168 @@ fn remember_address(instruction: &Instruction, addresses: &mut HashMap<Register,
     );
 }
 
-fn remember_loaded_byte(
-    instruction: &Instruction,
-    sections: &[SectionView<'_>],
-    bytes: &mut HashMap<Register, RegisterByte>,
-) {
-    if !matches!(instruction.mnemonic(), Mnemonic::Mov | Mnemonic::Movzx)
-        || instruction.op0_kind() != OpKind::Register
-        || instruction.op1_kind() != OpKind::Memory
-        || !instruction.is_ip_rel_memory_operand()
-    {
-        return;
+fn last_register_write<'a>(
+    history: &'a [Instruction],
+    reg: Register,
+    info: &mut InstructionInfoFactory,
+) -> Option<(&'a Instruction, &'a [Instruction])> {
+    for (index, inst) in history.iter().enumerate().rev() {
+        if inst.flow_control() != FlowControl::Next {
+            break;
+        }
+        if info.info(inst).used_registers().iter().any(|used| {
+            used.register().full_register() == reg.full_register()
+                && matches!(
+                    used.access(),
+                    OpAccess::Write
+                        | OpAccess::CondWrite
+                        | OpAccess::ReadWrite
+                        | OpAccess::ReadCondWrite
+                )
+        }) {
+            return Some((inst, &history[..index]));
+        }
     }
-    let address = instruction.ip_rel_memory_address();
-    if !writable_va(sections, address) {
-        return;
-    }
-    bytes.insert(
-        instruction.op0_register().full_register(),
-        RegisterByte {
-            address,
-            key: None,
-            instruction_va: instruction.ip(),
-            age: 0,
-        },
-    );
+    None
 }
 
-fn remember_register_xor(instruction: &Instruction, bytes: &mut HashMap<Register, RegisterByte>) {
-    if instruction.mnemonic() != Mnemonic::Xor
-        || instruction.op0_kind() != OpKind::Register
-        || !is_immediate(instruction.op1_kind())
-    {
-        return;
-    }
-    if let Some(value) = bytes.get_mut(&instruction.op0_register().full_register()) {
-        value.key = Some(instruction.immediate(1) as u8);
-        value.age = 0;
-    }
+fn copy_instruction(inst: &Instruction) -> bool {
+    matches!(
+        inst.mnemonic(),
+        Mnemonic::Mov
+            | Mnemonic::Movzx
+            | Mnemonic::Movss
+            | Mnemonic::Movsd
+            | Mnemonic::Movaps
+            | Mnemonic::Movups
+            | Mnemonic::Movdqa
+            | Mnemonic::Movdqu
+            | Mnemonic::Movapd
+            | Mnemonic::Movupd
+            | Mnemonic::Movq
+            | Mnemonic::Movd
+    )
 }
 
-fn remember_stored_byte(
-    instruction: &Instruction,
-    sections: &[SectionView<'_>],
-    bytes: &mut HashMap<Register, RegisterByte>,
+fn constant_register(
+    history: &[Instruction],
+    reg: Register,
+    info: &mut InstructionInfoFactory,
+) -> Option<u64> {
+    let (load, _) = last_register_write(history, reg, info)?;
+    (load.mnemonic() == Mnemonic::Mov
+        && load.op0_register() == reg
+        && is_immediate(load.op1_kind()))
+    .then(|| load.immediate(1))
+}
+
+fn record_mask(
     keys: &mut BTreeMap<u64, KeyByte>,
+    address: u64,
+    mask: &[u8],
+    ip: u64,
 ) -> Result<()> {
-    if instruction.mnemonic() != Mnemonic::Mov
-        || instruction.op0_kind() != OpKind::Memory
-        || instruction.op1_kind() != OpKind::Register
-        || !instruction.is_ip_rel_memory_operand()
-    {
-        return Ok(());
-    }
-    let address = instruction.ip_rel_memory_address();
-    let register = instruction.op1_register().full_register();
-    let Some(value) = bytes.get(&register).copied() else {
-        return Ok(());
-    };
-    let Some(key) = value.key else {
-        return Ok(());
-    };
-    if value.address == address && writable_va(sections, address) {
+    for (offset, &key) in mask.iter().enumerate() {
         insert_key(
             keys,
-            address,
+            address + offset as u64,
             KeyByte {
                 key,
-                instruction_va: value.instruction_va,
+                instruction_va: ip,
             },
         )?;
-        bytes.remove(&register);
+    }
+    Ok(())
+}
+
+fn recover_xor_store(
+    store: &Instruction,
+    history: &[Instruction],
+    info: &mut InstructionInfoFactory,
+    sections: &[SectionView<'_>],
+    keys: &mut BTreeMap<u64, KeyByte>,
+) -> Result<()> {
+    if !copy_instruction(store)
+        || store.op0_kind() != OpKind::Memory
+        || store.op1_kind() != OpKind::Register
+    {
+        return Ok(());
+    }
+    let stack = matches!(store.memory_base(), Register::RSP | Register::RBP)
+        && store.memory_index() == Register::None;
+    if !stack && !store.is_ip_rel_memory_operand() {
+        return Ok(());
+    }
+    let reg = store.op1_register();
+    let Some((xor, before)) = last_register_write(history, reg, info) else {
+        return Ok(());
+    };
+    if !matches!(
+        xor.mnemonic(),
+        Mnemonic::Xor | Mnemonic::Xorps | Mnemonic::Xorpd | Mnemonic::Pxor
+    ) || xor.op0_register() != reg
+    {
+        return Ok(());
+    }
+    let Some((load, _)) = last_register_write(before, reg, info) else {
+        return Ok(());
+    };
+    if !copy_instruction(load)
+        || load.op0_register().full_register() != reg.full_register()
+        || (load.op0_register() != reg
+            && (load.mnemonic() != Mnemonic::Movzx
+                || matches!(
+                    reg,
+                    Register::AH | Register::BH | Register::CH | Register::DH
+                )))
+    {
+        return Ok(());
+    }
+    let width = store.memory_size().size();
+    let immediate;
+    let (address, mask) = if load.is_ip_rel_memory_operand() && load.memory_size().size() >= width {
+        let source = load.ip_rel_memory_address();
+        if is_immediate(xor.op1_kind()) && width <= 8 {
+            immediate = xor.immediate(1).to_le_bytes();
+            (source, &immediate[..width])
+        } else if xor.is_ip_rel_memory_operand() && xor.memory_size().size() >= width {
+            let key = xor.ip_rel_memory_address();
+            // The optimizer may load the read-only mask first.
+            let (source, key) = if writable_va(sections, key) {
+                (key, source)
+            } else {
+                (source, key)
+            };
+            let Some(section) = sections
+                .iter()
+                .find(|s| !s.writable && !s.executable && contains_range(**s, key, width))
+            else {
+                return Ok(());
+            };
+            let offset = (key - section.address) as usize;
+            (source, &section.data[offset..offset + width])
+        } else {
+            return Ok(());
+        }
+    } else if is_immediate(load.op1_kind())
+        && load.op0_register() == reg
+        && xor.is_ip_rel_memory_operand()
+        && xor.memory_size().size() >= width
+        && width <= 8
+    {
+        immediate = load.immediate(1).to_le_bytes();
+        (xor.ip_rel_memory_address(), &immediate[..width])
+    } else {
+        return Ok(());
+    };
+    if !stack && store.ip_rel_memory_address() != address {
+        return Ok(());
+    }
+    if sections
+        .iter()
+        .any(|s| !s.executable && (s.writable || stack) && contains_range(*s, address, width))
+    {
+        record_mask(keys, address, mask, xor.ip())?;
     }
     Ok(())
 }
@@ -559,30 +701,44 @@ fn remember_memory_xor(
     following: &[Instruction],
     sections: &[SectionView<'_>],
     addresses: &HashMap<Register, (u64, usize)>,
+    history: &[Instruction],
+    info: &mut InstructionInfoFactory,
     keys: &mut BTreeMap<u64, KeyByte>,
 ) -> Result<()> {
-    if instruction.mnemonic() != Mnemonic::Xor
-        || instruction.op0_kind() != OpKind::Memory
-        || !is_immediate(instruction.op1_kind())
-    {
+    if instruction.mnemonic() != Mnemonic::Xor || instruction.op0_kind() != OpKind::Memory {
         return Ok(());
     }
-    let key = instruction.immediate(1) as u8;
+    let mask = if is_immediate(instruction.op1_kind()) {
+        instruction.immediate(1)
+    } else if instruction.op1_kind() == OpKind::Register {
+        let Some(value) = constant_register(history, instruction.op1_register(), info) else {
+            return Ok(());
+        };
+        value
+    } else {
+        return Ok(());
+    };
+    let width = instruction.memory_size().size();
     if instruction.is_ip_rel_memory_operand() {
         let address = instruction.ip_rel_memory_address();
-        if writable_va(sections, address) {
-            insert_key(
+        if (1..=8).contains(&width)
+            && sections
+                .iter()
+                .any(|s| s.writable && !s.executable && contains_range(*s, address, width))
+        {
+            record_mask(
                 keys,
                 address,
-                KeyByte {
-                    key,
-                    instruction_va: instruction.ip(),
-                },
+                &mask.to_le_bytes()[..width],
+                instruction.ip(),
             )?;
         }
         return Ok(());
     }
-
+    if width != 1 {
+        return Ok(());
+    }
+    let key = mask as u8;
     let base = instruction.memory_base().full_register();
     let index = instruction.memory_index().full_register();
     let (known, variable) = match (addresses.get(&base), addresses.get(&index)) {
@@ -713,17 +869,17 @@ fn decode_key_runs(
             .map(|(byte, (_, key))| byte ^ key.key)
             .collect::<Vec<_>>();
         let mut segment_start = 0;
-        for segment_end in plaintext
-            .iter()
-            .enumerate()
-            .filter_map(|(index, byte)| (*byte == 0).then_some(index + 1))
-            .chain(std::iter::once(plaintext.len()))
-        {
-            if segment_end <= segment_start {
-                continue;
-            }
-            let plain = plaintext[segment_start..segment_end].to_vec();
-            let encrypted = encrypted[segment_start..segment_end].to_vec();
+        while segment_start < plaintext.len() {
+            let rest = &plaintext[segment_start..];
+            let wide = wide_prefix(rest);
+            let len = wide.map(|(_, len)| len).unwrap_or_else(|| {
+                rest.iter()
+                    .position(|b| *b == 0)
+                    .map_or(rest.len(), |i| i + 1)
+            });
+            let segment_end = segment_start + len;
+            let plain = &rest[..len];
+            let encrypted = &encrypted[segment_start..segment_end];
             if plain.iter().all(|byte| *byte == 0) {
                 segment_start = segment_end;
                 continue;
@@ -739,7 +895,7 @@ fn decode_key_runs(
             } else {
                 item_evidence.push("boundary:nul_terminator".to_owned());
             }
-            strings.push(recovered_bytes(
+            let mut item = recovered_bytes(
                 format!("pe.va_{va:016x}"),
                 strings.len(),
                 Some(section.name.to_owned()),
@@ -747,7 +903,12 @@ fn decode_key_runs(
                 encrypted,
                 plain,
                 item_evidence,
-            ));
+            );
+            if let Some((width, _)) = wide {
+                item.set_wide_text(plain, width);
+                item.evidence.push("inferred_wide_code_units".to_owned());
+            }
+            strings.push(item);
             segment_start = segment_end;
         }
     }
@@ -765,12 +926,33 @@ fn recover_plain_sections(sections: &[SectionView<'_>]) -> Vec<RecoveredString> 
             while start < section.data.len() && !plain_byte(section.data[start]) {
                 start += 1;
             }
+            let separated = start == 0 || section.data[start - 1] == 0;
+            if separated && let Some((width, len)) = wide_prefix(&section.data[start..]) {
+                let bytes = &section.data[start..start + len];
+                let va = section.address + start as u64;
+                let mut item = recovered_bytes(
+                    format!("pe.va_{va:016x}"),
+                    strings.len(),
+                    Some(section.name.to_owned()),
+                    StringAlgorithm::Plain,
+                    bytes,
+                    bytes,
+                    vec![
+                        "plain_pe_data".to_owned(),
+                        format!("va:0x{va:016x}"),
+                        "inferred_wide_code_units".to_owned(),
+                    ],
+                );
+                item.set_wide_text(bytes, width);
+                strings.push(item);
+                start += len;
+                continue;
+            }
             let mut end = start;
             while end < section.data.len() && plain_byte(section.data[end]) {
                 end += 1;
             }
             let terminated = end < section.data.len() && section.data[end] == 0;
-            let separated = start == 0 || section.data[start - 1] == 0;
             let body = &section.data[start..end];
             if body.len() >= MIN_PLAIN_LEN
                 && terminated
@@ -785,8 +967,8 @@ fn recover_plain_sections(sections: &[SectionView<'_>]) -> Vec<RecoveredString> 
                     strings.len(),
                     Some(section.name.to_owned()),
                     StringAlgorithm::Plain,
-                    bytes.clone(),
-                    bytes,
+                    &bytes,
+                    &bytes,
                     vec!["plain_pe_data".to_owned(), format!("va:0x{va:016x}")],
                 ));
             }
@@ -807,10 +989,10 @@ fn writable_va(sections: &[SectionView<'_>], address: u64) -> bool {
 }
 
 fn contains_range(section: SectionView<'_>, address: u64, len: usize) -> bool {
-    address >= section.address
-        && address
-            .checked_add(len as u64)
-            .is_some_and(|end| end <= section.address + section.data.len() as u64)
+    address
+        .checked_sub(section.address)
+        .and_then(|offset| offset.checked_add(len as u64))
+        .is_some_and(|end| end <= section.data.len() as u64)
 }
 
 fn is_immediate(kind: OpKind) -> bool {

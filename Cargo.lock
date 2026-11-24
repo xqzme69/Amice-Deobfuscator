@@ -4,21 +4,34 @@ version = 4
 
 [[package]]
 name = "amice-devirt"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
- "amice-vm",
+ "amice-vm 0.1.0 (git+https://github.com/fuqiuluo/amice?rev=2c019b01679717657e820c9220342a0a19f214a9)",
+ "amice-vm 0.1.0 (git+https://github.com/fuqiuluo/amice?rev=3fb1a97f4b053c300abda2bcc44ca3b7daa9640e)",
  "anyhow",
  "iced-x86",
  "object",
  "pdb",
  "serde",
  "serde_json",
+ "toml",
 ]
 
 [[package]]
 name = "amice-vm"
 version = "0.1.0"
 source = "git+https://github.com/fuqiuluo/amice?rev=2c019b01679717657e820c9220342a0a19f214a9#2c019b01679717657e820c9220342a0a19f214a9"
+dependencies = [
+ "anyhow",
+ "serde",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
+name = "amice-vm"
+version = "0.1.0"
+source = "git+https://github.com/fuqiuluo/amice?rev=3fb1a97f4b053c300abda2bcc44ca3b7daa9640e#3fb1a97f4b053c300abda2bcc44ca3b7daa9640e"
 dependencies = [
  "anyhow",
  "serde",

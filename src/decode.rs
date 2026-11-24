@@ -561,11 +561,8 @@ fn valid_descriptor_tables(
         })
         .filter_map(|global| {
             let mut descriptors = Vec::with_capacity(global.len / DESCRIPTOR_FIELD_COUNT);
-            for (fn_index, row) in global
-                .words
-                .chunks_exact(DESCRIPTOR_FIELD_COUNT)
-                .enumerate()
-            {
+            let (rows, _) = global.words.as_chunks::<DESCRIPTOR_FIELD_COUNT>();
+            for (fn_index, row) in rows.iter().enumerate() {
                 let fields = decrypt_descriptor_words(seed, fn_index, row)?;
                 descriptors.push(fields);
             }

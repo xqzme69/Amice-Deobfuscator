@@ -1,7 +1,7 @@
 use crate::bytecode::{VmOperand, VmRecord};
 use crate::decode::{DecodeReport, DecodedDescriptor};
 use crate::package::PackageReport;
-use amice_vm::isa::{HandlerSemantic, OperandKind, SuperOp};
+use amice_vm::isa::{AtomicRmwOp, HandlerSemantic, OperandKind, SuperOp};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -394,6 +394,31 @@ fn lift_record(record: &VmRecord) -> String {
         HandlerSemantic::Store | HandlerSemantic::VolatileStore => {
             lift_store(record).unwrap_or_else(unknown)
         }
+        HandlerSemantic::AtomicRmw(op) | HandlerSemantic::VolatileAtomicRmw(op) => {
+            let volatile = if matches!(record.semantic, HandlerSemantic::VolatileAtomicRmw(_)) {
+                "volatile "
+            } else {
+                ""
+            };
+            lift_assign(record, "dst", |record| {
+                Some(format!(
+                    "{volatile}atomicrmw {} {}, {}, width {}, ordering {}, sync_scope {}",
+                    match op {
+                        AtomicRmwOp::UIncWrap => "uinc_wrap".to_owned(),
+                        AtomicRmwOp::UDecWrap => "udec_wrap".to_owned(),
+                        AtomicRmwOp::USubCond => "usub_cond".to_owned(),
+                        AtomicRmwOp::USubSat => "usub_sat".to_owned(),
+                        _ => debug_name(op),
+                    },
+                    register(record, "ptr")?,
+                    register(record, "src")?,
+                    value(record, "width")?,
+                    value(record, "ordering")?,
+                    value(record, "sync_scope")?
+                ))
+            })
+            .unwrap_or_else(unknown)
+        }
         HandlerSemantic::Br => operand(record, "target")
             .and_then(|target| target.resolved.clone())
             .map(|target| format!("br {target}"))
@@ -579,4 +604,63 @@ fn sanitize_pseudo_name(name: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use amice_vm::isa::{AtomicRmwOp, MemoryOrdering};
+    use amice_vm::{BytecodeEncoder, ProfilePackage, VmFunctionBuilder, VmInstruction};
+
+    #[test]
+    fn lifts_new_atomic_handlers_from_upstream_bytecode() {
+        let profile = ProfilePackage::builtin_test().unwrap();
+        amice_vm::verify::verify_profile(&profile).unwrap();
+        let mut function = VmFunctionBuilder::new("atomics", 3, 0);
+        let ordering = MemoryOrdering::SequentiallyConsistent;
+        for op in [AtomicRmwOp::FMaximumNum, AtomicRmwOp::FMinimumNum] {
+            function.push(VmInstruction::AtomicRmw {
+                op,
+                dst: 0,
+                ptr: 1,
+                src: 2,
+                width: 64,
+                ordering,
+                sync_scope: 1,
+            });
+            function.push(VmInstruction::VolatileAtomicRmw {
+                op,
+                dst: 0,
+                ptr: 1,
+                src: 2,
+                width: 64,
+                ordering,
+                sync_scope: 1,
+            });
+        }
+        let image = BytecodeEncoder::new(&profile)
+            .encode(&function.finish().unwrap())
+            .unwrap();
+        let records =
+            crate::bytecode::decode_function_records(&profile, 0, image.code_bytes(), image.key)
+                .unwrap();
+        let lifted: Vec<_> = records
+            .iter()
+            .filter(|r| r.mnemonic.contains("atomic_rmw"))
+            .map(lift_record)
+            .collect();
+        let expected = [
+            "atomicrmw fmaximumnum",
+            "volatile atomicrmw fmaximumnum",
+            "atomicrmw fminimumnum",
+            "volatile atomicrmw fminimumnum",
+        ]
+        .map(|op| {
+            format!(
+                "x0 = {op} x1, x2, width 64, ordering {}, sync_scope 1",
+                ordering as u8
+            )
+        });
+        assert_eq!(lifted, expected);
+    }
 }

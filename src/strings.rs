@@ -42,6 +42,8 @@ pub struct RecoveredString {
     pub encrypted_hex: String,
     pub plaintext_hex: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     pub escaped: String,
     pub nul_terminated: bool,
@@ -58,7 +60,8 @@ pub struct StringReport {
 }
 
 pub fn recover_strings(module: &LlModule, options: &StringDecodeOptions) -> Result<StringReport> {
-    let (detected, mut report_evidence) = detect_algorithm(module)?;
+    let stack_refs = xor_stack_sources(module);
+    let (detected, mut report_evidence) = detect_algorithm(module, !stack_refs.is_empty())?;
     let mut algorithm = options.algorithm.or(detected);
     if options.key_global.is_some() && algorithm != Some(StringAlgorithm::SimdXor) {
         bail!("--string-key-global requires simd_xor string algorithm");
@@ -71,7 +74,7 @@ pub fn recover_strings(module: &LlModule, options: &StringDecodeOptions) -> Resu
     let mut key_global = None;
     let mut strings = Vec::new();
     if let Some(selected_algorithm) = algorithm {
-        let refs = decryptor_global_refs(module, selected_algorithm);
+        let mut refs = decryptor_global_refs(module, selected_algorithm);
         let (selected_key_global, key, key_evidence) = match selected_algorithm {
             StringAlgorithm::Plain => (None, Vec::new(), None),
             StringAlgorithm::Xor => (None, vec![0xaa], None),
@@ -81,12 +84,24 @@ pub fn recover_strings(module: &LlModule, options: &StringDecodeOptions) -> Resu
             }
         };
         key_global = selected_key_global;
+        refs.extend(stack_refs);
+        for function in &module.functions {
+            for name in &function.global_refs {
+                if let Some(source) = name.strip_prefix("dec_flag_")
+                    && function.global_refs.iter().any(|other| other == source)
+                {
+                    refs.insert(source.to_owned());
+                }
+            }
+        }
         if let Some(evidence) = key_evidence {
             report_evidence.push(evidence);
         }
 
         for literal in &module.byte_literals {
-            if key_global.as_deref() == Some(literal.name.as_str()) {
+            if key_global.as_deref() == Some(literal.name.as_str())
+                || literal.section.as_deref() == Some("llvm.metadata") && requested.is_none()
+            {
                 continue;
             }
             let marked = is_string_marked(literal);
@@ -123,26 +138,32 @@ pub fn recover_strings(module: &LlModule, options: &StringDecodeOptions) -> Resu
                     .map(|(byte, key_byte)| byte ^ key_byte)
                     .collect::<Vec<_>>(),
             };
-            if selected_algorithm == StringAlgorithm::Plain && !is_plain_string(&plaintext) {
+            if literal.element_bytes > 1
+                && (literal.len <= literal.element_bytes
+                    || !plaintext.ends_with(&[0; 4][..literal.element_bytes]))
+            {
+                continue;
+            }
+            if selected_algorithm == StringAlgorithm::Plain && !plain_literal(literal) {
                 continue;
             }
             strings.push(recovered_literal(
                 literal,
                 selected_algorithm,
-                plaintext,
+                &plaintext,
                 referenced,
                 selected,
             ));
         }
     } else {
         strings.extend(recover_plain_globals(module, requested.as_ref()));
-        if requested.is_none() {
-            strings.extend(recover_stack_strings(module));
-        }
-        if !strings.is_empty() {
-            algorithm = Some(StringAlgorithm::Plain);
-            report_evidence.push("optimized_plaintext".to_owned());
-        }
+    }
+    if requested.is_none() && module.source.contains("string_container") {
+        strings.extend(recover_stack_strings(module));
+    }
+    if algorithm.is_none() && !strings.is_empty() {
+        algorithm = Some(StringAlgorithm::Plain);
+        report_evidence.push("optimized_plaintext".to_owned());
     }
 
     if options.globals.is_some() && strings.is_empty() {
@@ -177,8 +198,51 @@ pub fn write_string_report(report: &StringReport, out_dir: &Path) -> Result<()> 
     fs::write(&text_path, text).with_context(|| format!("write {}", text_path.display()))
 }
 
-fn detect_algorithm(module: &LlModule) -> Result<(Option<StringAlgorithm>, Vec<String>)> {
-    let xor = module.functions.iter().any(is_xor_function)
+fn xor_stack_sources(module: &LlModule) -> HashSet<String> {
+    let mut sources = HashSet::new();
+    for body in module
+        .source
+        .split("\n}")
+        .filter(|b| b.contains("string_container") && b.contains("load volatile i8"))
+    {
+        let mut destinations = HashSet::new();
+        let mut loads = HashMap::new();
+        let mut decoded = HashMap::new();
+        for line in body.lines().map(str::trim) {
+            if let Some((name, _)) = stack_alloca(line) {
+                destinations.insert(name);
+            } else if let Some((gep, container, _)) = stack_gep(line)
+                && destinations.contains(&container)
+            {
+                destinations.insert(gep);
+            } else if let Some((name, ptr)) = line.split_once(" = load volatile i8, ptr ")
+                && let Some(global) = crate::llvm_ir::parse_at_name(ptr)
+            {
+                loads.insert(name, global);
+            } else if let Some((name, rhs)) = line.split_once(" = xor i8 ")
+                && let Some(src) = rhs.strip_suffix(", -86")
+                && let Some(global) = loads.get(src)
+            {
+                decoded.insert(name, global.clone());
+            } else if let Some((src, dst)) = line
+                .strip_prefix("store volatile i8 ")
+                .and_then(|s| s.split_once(", ptr "))
+                && destinations.contains(dst.split(',').next().unwrap_or(dst))
+                && let Some(global) = decoded.get(src)
+            {
+                sources.insert((*global).clone());
+            }
+        }
+    }
+    sources
+}
+
+fn detect_algorithm(
+    module: &LlModule,
+    xor_stack: bool,
+) -> Result<(Option<StringAlgorithm>, Vec<String>)> {
+    let xor = xor_stack
+        || module.functions.iter().any(is_xor_function)
         || source_has_label(&module.source, "__amice__decrypt_strings_");
     let simd = module.functions.iter().any(is_simd_function)
         || source_has_label(&module.source, "simd_xor_cipher_");
@@ -284,7 +348,15 @@ fn select_simd_key(
     let candidates = module
         .byte_globals
         .iter()
-        .filter(|global| global.len == 32 && refs.contains(&global.name))
+        .filter(|global| {
+            global.len == 32
+                && refs.contains(&global.name)
+                && !global.name.contains(".str")
+                && !global
+                    .section
+                    .as_deref()
+                    .is_some_and(|s| s.contains(".str"))
+        })
         .collect::<Vec<_>>();
     match candidates.as_slice() {
         [global] => Ok(SimdKey {
@@ -292,7 +364,7 @@ fn select_simd_key(
             bytes: global.bytes.clone(),
             evidence: "referenced_key_global".to_owned(),
         }),
-        [] => inline_simd_key(&module.source)
+        [] => addressed_simd_key(module)?.or_else(|| inline_simd_key(&module.source))
             .map(|bytes| SimdKey {
                 global: None,
                 bytes,
@@ -310,6 +382,95 @@ fn select_simd_key(
                 .join(", ")
         ),
     }
+}
+
+// LLVM can vectorize the middle of a decrypt loop and number each scalar tail
+// from zero again. Recover the key position from the writeback address.
+fn addressed_simd_key(module: &LlModule) -> Result<Option<Vec<u8>>> {
+    let literals: HashSet<_> = module
+        .byte_literals
+        .iter()
+        .map(|literal| literal.name.as_str())
+        .collect();
+    let mut key = BTreeMap::new();
+    let mut loads = HashMap::new();
+    let mut xors = HashMap::new();
+    for body in module.source.split("\n}") {
+        if !(body.contains("simd_xor_cipher_") || body.contains("simd_xor_decrypt_stub")) {
+            continue;
+        }
+        loads.clear();
+        xors.clear();
+        for line in body.lines().map(str::trim) {
+            if let Some((result, load)) = line.split_once(" = load ")
+                && let Some((ty, pointer)) = load.split_once(", ptr ")
+                && let Some((name, offset)) = global_byte_address(pointer)
+                && (literals.contains(name)
+                    || (name.starts_with('"')
+                        && crate::llvm_ir::parse_at_name(pointer)
+                            .is_some_and(|n| literals.contains(n.as_str()))))
+            {
+                loads.insert(result, (ty, name, offset));
+            } else if let Some((result, xor)) = line.split_once(" = xor ")
+                && let Some((lhs, mask)) = xor.split_once(", ")
+                && let Some((ty, source)) = lhs.rsplit_once(' ')
+                && let Some(&(load_ty, name, offset)) = loads.get(source)
+                && load_ty == ty
+                && let Some(bytes) = byte_constant(ty, mask)
+            {
+                xors.insert(result, (ty, name, offset, bytes));
+            } else if let Some(store) = line.strip_prefix("store ")
+                && let Some((lhs, pointer)) = store.split_once(", ptr ")
+                && let Some((ty, result)) = lhs.rsplit_once(' ')
+                && let Some((xor_ty, name, offset, bytes)) = xors.get(result)
+                && ty == *xor_ty
+                && global_byte_address(pointer) == Some((*name, *offset))
+            {
+                for (i, &byte) in bytes.iter().enumerate() {
+                    let index = (offset % 32 + i) % 32;
+                    if key.insert(index, byte).is_some_and(|old| old != byte) {
+                        bail!("conflicting inlined simd_xor keys at byte {index}");
+                    }
+                }
+            }
+        }
+    }
+    Ok((!key.is_empty()).then(|| contiguous_bytes(&key)))
+}
+
+fn global_byte_address(pointer: &str) -> Option<(&str, usize)> {
+    if let Some(name) = pointer.strip_prefix('@') {
+        return Some((name.split(',').next()?, 0));
+    }
+    let gep = pointer.strip_prefix("getelementptr ")?;
+    let (_, args) = gep.split_once("(i8, ptr @")?;
+    let (name, index) = args.split_once(", i64 ")?;
+    Some((name, index.split_once(')')?.0.parse().ok()?))
+}
+
+fn byte_constant(ty: &str, value: &str) -> Option<Vec<u8>> {
+    let parse = |n: &str| {
+        n.parse::<i16>()
+            .ok()
+            .filter(|n| (-128..=255).contains(n))
+            .map(|n| n as u8)
+    };
+    if ty == "i8" {
+        return Some(vec![parse(value.split(',').next()?)?]);
+    }
+    let lanes: usize = ty.strip_prefix('<')?.strip_suffix(" x i8>")?.parse().ok()?;
+    if !(1..=32).contains(&lanes) {
+        return None;
+    }
+    if let Some(splat) = value.strip_prefix("splat (i8 ") {
+        return Some(vec![parse(splat.split_once(')')?.0)?; lanes]);
+    }
+    let body = value.strip_prefix('<')?.split_once('>')?.0;
+    let bytes = body
+        .split(", ")
+        .map(|n| parse(n.strip_prefix("i8 ")?))
+        .collect::<Option<Vec<_>>>()?;
+    (bytes.len() == lanes).then_some(bytes)
 }
 
 fn inline_simd_key(source: &str) -> Option<Vec<u8>> {
@@ -381,13 +542,13 @@ fn recover_plain_globals(
             requested
                 .map(|names| names.contains(&literal.name))
                 .unwrap_or_else(|| is_string_marked(literal))
-                && is_plain_string(&literal.bytes)
+                && plain_literal(literal)
         })
         .map(|literal| {
             recovered_literal(
                 literal,
                 StringAlgorithm::Plain,
-                literal.bytes.clone(),
+                &literal.bytes,
                 false,
                 false,
             )
@@ -426,7 +587,7 @@ fn recover_stack_strings(module: &LlModule) -> Vec<RecoveredString> {
             geps.insert((function.clone(), gep), (container, index));
             continue;
         }
-        let Some((pointer, value)) = constant_byte_store(line) else {
+        let Some((pointer, values)) = constant_byte_store(line) else {
             continue;
         };
         let target = if containers.contains_key(&(function.clone(), pointer.clone())) {
@@ -436,8 +597,12 @@ fn recover_stack_strings(module: &LlModule) -> Vec<RecoveredString> {
         };
         if let Some((container, index)) = target
             && let Some(entry) = containers.get_mut(&(function.clone(), container))
+            && index <= entry.len
+            && values.len() <= entry.len - index
         {
-            entry.bytes.insert(index, value);
+            for (n, byte) in values.into_iter().enumerate() {
+                entry.bytes.insert(index + n, byte);
+            }
         }
     }
 
@@ -445,18 +610,27 @@ fn recover_stack_strings(module: &LlModule) -> Vec<RecoveredString> {
         .into_iter()
         .filter_map(|((function, name), container)| {
             let bytes = contiguous_bytes(&container.bytes);
-            if bytes.len() < 2 || bytes.len() > container.len || !is_plain_string(&bytes) {
+            let wide = wide_prefix(&bytes).filter(|(_, end)| *end == bytes.len());
+            if bytes.len() < 2
+                || bytes.len() > container.len
+                || (wide.is_none() && !is_plain_string(&bytes))
+            {
                 return None;
             }
-            Some(recovered_bytes(
+            let mut result = recovered_bytes(
                 format!("stack:{function}:{name}"),
                 0,
                 None,
                 StringAlgorithm::Plain,
-                bytes.clone(),
-                bytes,
+                &bytes,
+                &bytes,
                 vec!["amice_stack_container".to_owned()],
-            ))
+            );
+            if let Some((width, _)) = wide {
+                result.set_wide_text(&bytes, width);
+                result.evidence.push("inferred_wide_code_units".to_owned());
+            }
+            Some(result)
         })
         .collect()
 }
@@ -486,17 +660,19 @@ fn stack_gep(line: &str) -> Option<(String, String, usize)> {
     Some((name.to_owned(), pointer.to_owned(), index))
 }
 
-fn constant_byte_store(line: &str) -> Option<(String, u8)> {
-    let rest = line.strip_prefix("store i8 ")?;
-    let (value, pointer) = rest.split_once(", ptr ")?;
-    let value = value.trim().parse::<i16>().ok()?;
-    if !(-128..=255).contains(&value) {
+fn constant_byte_store(line: &str) -> Option<(String, Vec<u8>)> {
+    let (lhs, pointer) = line.strip_prefix("store ")?.split_once(", ptr ")?;
+    let pointer = pointer.split([',', ' ']).next()?;
+    if !pointer.starts_with('%') {
         return None;
     }
-    let pointer = pointer.split([',', ' ']).next()?;
-    pointer
-        .starts_with('%')
-        .then(|| (pointer.to_owned(), value as u8))
+    let (ty, value) = if lhs.starts_with('<') {
+        let end = lhs.find("> ")? + 1;
+        (&lhs[..end], &lhs[end + 1..])
+    } else {
+        lhs.split_once(' ')?
+    };
+    Some((pointer.to_owned(), byte_constant(ty, value)?))
 }
 
 fn function_name(line: &str) -> Option<String> {
@@ -510,7 +686,7 @@ fn function_name(line: &str) -> Option<String> {
 fn recovered_literal(
     literal: &ByteLiteralGlobal,
     algorithm: StringAlgorithm,
-    plaintext: Vec<u8>,
+    plaintext: &[u8],
     referenced: bool,
     selected: bool,
 ) -> RecoveredString {
@@ -532,15 +708,19 @@ fn recovered_literal(
     if selected {
         evidence.push("global_override".to_owned());
     }
-    recovered_bytes(
+    let mut recovered = recovered_bytes(
         literal.name.clone(),
         literal.literal_index,
         literal.section.clone(),
         algorithm,
-        literal.bytes.clone(),
+        &literal.bytes,
         plaintext,
         evidence,
-    )
+    );
+    if literal.element_bytes > 1 {
+        recovered.set_wide_text(plaintext, literal.element_bytes);
+    }
+    recovered
 }
 
 pub(crate) fn recovered_bytes(
@@ -548,8 +728,8 @@ pub(crate) fn recovered_bytes(
     literal_index: usize,
     section: Option<String>,
     algorithm: StringAlgorithm,
-    encrypted: Vec<u8>,
-    plaintext: Vec<u8>,
+    encrypted: &[u8],
+    plaintext: &[u8],
     evidence: Vec<String>,
 ) -> RecoveredString {
     let nul_terminated = plaintext.last() == Some(&0);
@@ -564,12 +744,93 @@ pub(crate) fn recovered_bytes(
         section,
         algorithm,
         evidence,
-        encrypted_hex: hex_bytes(&encrypted),
-        plaintext_hex: hex_bytes(&plaintext),
+        encrypted_hex: hex_bytes(encrypted),
+        plaintext_hex: hex_bytes(plaintext),
+        encoding: None,
         text: String::from_utf8(display.to_vec()).ok(),
         escaped: escape_bytes(display),
         nul_terminated,
     }
+}
+
+impl RecoveredString {
+    pub(crate) fn set_wide_text(&mut self, bytes: &[u8], width: usize) {
+        self.encoding = Some(if width == 2 { "utf-16le" } else { "utf-32le" });
+        self.nul_terminated = bytes.ends_with(&[0; 4][..width]);
+        self.text = wide_text(bytes, width);
+        self.escaped = match &self.text {
+            Some(text) => text.chars().flat_map(char::escape_default).collect(),
+            None => escape_bytes(bytes),
+        };
+    }
+}
+
+pub(crate) fn wide_text(bytes: &[u8], width: usize) -> Option<String> {
+    let mut units = bytes.chunks_exact(width);
+    if !units.remainder().is_empty() {
+        return None;
+    }
+    let len = units
+        .rposition(|unit| unit.iter().any(|&b| b != 0))
+        .map_or(0, |i| (i + 1) * width);
+    let body = &bytes[..len];
+    match width {
+        2 => {
+            let (units, _) = body.as_chunks();
+            char::decode_utf16(units.iter().copied().map(u16::from_le_bytes))
+                .collect::<Result<String, _>>()
+                .ok()
+        }
+        4 => {
+            let (units, _) = body.as_chunks();
+            units
+                .iter()
+                .map(|&u| char::from_u32(u32::from_le_bytes(u)))
+                .collect()
+        }
+        _ => None,
+    }
+}
+
+fn plain_literal(literal: &ByteLiteralGlobal) -> bool {
+    if literal.element_bytes == 1 {
+        return is_plain_string(&literal.bytes);
+    }
+    literal.bytes.ends_with(&[0; 4][..literal.element_bytes])
+        && wide_text(&literal.bytes, literal.element_bytes).is_some_and(|s| {
+            !s.is_empty()
+                && s.chars()
+                    .all(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
+        })
+}
+
+// Untyped storage needs stronger evidence than a typed LLVM initializer.
+// Two printable ASCII code units establish the zero-byte lane pattern.
+pub(crate) fn wide_prefix(bytes: &[u8]) -> Option<(usize, usize)> {
+    for width in [4, 2] {
+        let mut units = bytes.chunks_exact(width);
+        if units.len() < 4
+            || !units
+                .by_ref()
+                .take(2)
+                .all(|u| u[0].is_ascii_graphic() && u[1..].iter().all(|&b| b == 0))
+        {
+            continue;
+        }
+        let Some(remaining) = units.position(|u| u.iter().all(|&b| b == 0)) else {
+            continue;
+        };
+        let end = (remaining + 3) * width;
+        if remaining > 0
+            && wide_text(&bytes[..end], width).is_some_and(|s| {
+                s.chars()
+                    .all(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
+            })
+        {
+            return Some((width, end));
+        }
+    }
+    None
 }
 
 fn is_plain_string(bytes: &[u8]) -> bool {
@@ -658,6 +919,31 @@ define internal void @decrypt_strings_stub() {
         assert_eq!(report.strings.len(), 1);
         assert_eq!(report.strings[0].text.as_deref(), Some("hello"));
         assert!(report.strings[0].nul_terminated);
+    }
+
+    #[test]
+    fn preserves_typed_wide_fields_and_skips_unterminated_integer_tables() {
+        let module = parse_ll_module(r#"
+@.str.fields = internal constant { [2 x i32], [2 x i8], [4 x i16] } { [2 x i32] [i32 128512, i32 0], [2 x i8] c"A\00", [4 x i16] [i16 937, i16 19990, i16 0, i16 0] }
+@.str.table = internal constant [2 x i32] [i32 65, i32 1]
+"#).unwrap();
+        let report = recover_strings(&module, &StringDecodeOptions::default()).unwrap();
+        let literals: Vec<_> = report
+            .strings
+            .iter()
+            .map(|s| (s.literal_index, s.text.as_deref(), s.encoding))
+            .collect();
+        assert_eq!(
+            literals,
+            [
+                (0, Some("😀"), Some("utf-32le")),
+                (1, Some("A"), None),
+                (2, Some("Ω世"), Some("utf-16le"))
+            ]
+        );
+        assert_eq!(report.strings[2].plaintext_hex, "a903164e00000000");
+        assert!(wide_text(&[0, 0xd8, 0, 0], 2).is_none());
+        assert!(wide_text(&[0, 0, 0x11, 0], 4).is_none());
     }
 
     #[test]
@@ -766,6 +1052,31 @@ simd_xor_cipher_123.exit:
         let error = recover_strings(&module, &StringDecodeOptions::default()).unwrap_err();
 
         assert!(error.to_string().contains("proves only 2 bytes"));
+    }
+
+    #[test]
+    fn rejects_conflicting_simd_writebacks_at_the_same_key_offset() {
+        let module = parse_ll_module(
+            r#"
+@.str.a = internal global [2 x i8] c"AB"
+@.str.b = internal global [2 x i8] c"CD"
+define void @simd_xor_decrypt_stub() {
+  %a = load i8, ptr @.str.a
+  %x = xor i8 %a, 12
+  store i8 %x, ptr @.str.a
+  %b = load i8, ptr @.str.b
+  %y = xor i8 %b, 13
+  store i8 %y, ptr @.str.b
+  ret void
+}
+"#,
+        )
+        .unwrap();
+        let err = recover_strings(&module, &StringDecodeOptions::default()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("conflicting inlined simd_xor keys at byte 0")
+        );
     }
 
     #[test]

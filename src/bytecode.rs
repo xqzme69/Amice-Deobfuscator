@@ -4,6 +4,7 @@ use amice_vm::{ProfilePackage, isa::Opcode};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::collections::HashSet;
+use std::sync::LazyLock;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct VmOperand {
@@ -34,14 +35,37 @@ pub fn decode_function_records(
 ) -> Result<Vec<VmRecord>> {
     let mut records = Vec::new();
     let mut pc = 0_usize;
+    let mut is_builtin = None;
 
     while pc < code.len() {
         let mut cursor = pc;
         let opcode = read_varint(profile, code, bytecode_key, &mut cursor)
             .with_context(|| format!("decode opcode at fn {fn_index} pc {pc}"))?;
-        let desc = profile.isa.by_opcode(opcode as Opcode).with_context(|| {
-            format!("opcode 0x{opcode:x} at fn {fn_index} pc {pc} is not in profile ISA")
-        })?;
+        let opcode = Opcode::try_from(opcode)
+            .with_context(|| format!("opcode 0x{opcode:x} exceeds u16 at fn {fn_index} pc {pc}"))?;
+        let desc = profile
+            .isa
+            .by_opcode(opcode)
+            .or_else(|| {
+                // The official simple ISA retired some aliases without reusing them.
+                // Custom profiles must resolve their own opcodes.
+                static OLD: LazyLock<amice_vm_legacy::ProfilePackage> = LazyLock::new(|| {
+                    amice_vm_legacy::ProfilePackage::builtin_test()
+                        .expect("embedded legacy profile")
+                });
+                static CURRENT: LazyLock<ProfilePackage> = LazyLock::new(|| {
+                    ProfilePackage::builtin_test().expect("embedded current profile")
+                });
+                let old = OLD.isa.by_opcode(opcode)?;
+                if *is_builtin.get_or_insert_with(|| profile == &*CURRENT) {
+                    profile.isa.by_name(&old.name)
+                } else {
+                    None
+                }
+            })
+            .with_context(|| {
+                format!("opcode 0x{opcode:x} at fn {fn_index} pc {pc} is not in profile ISA")
+            })?;
         let next_pc = pc
             .checked_add(desc.decoded_width as usize)
             .context("VM record offset overflow")?;
@@ -83,7 +107,7 @@ pub fn decode_function_records(
         records.push(VmRecord {
             fn_index,
             pc,
-            opcode: opcode as u16,
+            opcode,
             mnemonic: desc.name.clone(),
             semantic: desc.semantic.clone(),
             operands,
@@ -365,6 +389,35 @@ mod tests {
 
         let err = decode_function_records(&profile, 0, &code, 0).unwrap_err();
         assert!(err.to_string().contains("non-zero decoded padding"));
+    }
+
+    #[test]
+    fn decodes_retired_simple_aliases_only_for_the_official_profile() {
+        let profile = ProfilePackage::builtin_test().unwrap();
+        let old = amice_vm_legacy::ProfilePackage::builtin_test().unwrap();
+        let mut custom = profile.clone();
+        custom.manifest.name = "custom".to_owned();
+        let mut retired = 0;
+        for desc in old.isa.instructions {
+            for &opcode in desc.opcodes() {
+                if let Some(current) = profile.isa.by_opcode(opcode) {
+                    assert_eq!(current.name, desc.name);
+                    continue;
+                }
+                let mut code = vec![0; desc.decoded_width as usize];
+                assert!((0x80..0x4000).contains(&opcode));
+                code[0] = opcode as u8 | 0x80;
+                code[1] = (opcode >> 7) as u8;
+                for (offset, byte) in code.iter_mut().enumerate() {
+                    *byte = encode_stream_byte_for_test(&profile, *byte, 0, offset);
+                }
+                let records = decode_function_records(&profile, 0, &code, 0).unwrap();
+                assert_eq!(records[0].mnemonic, desc.name);
+                assert!(decode_function_records(&custom, 0, &code, 0).is_err());
+                retired += 1;
+            }
+        }
+        assert_eq!(retired, 16);
     }
 
     #[test]

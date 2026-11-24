@@ -1,8 +1,28 @@
 # test results
 
-last full run: 2026-08-01 on Windows x86-64.
+## 0.2.0 with Amice v0.1.6-beta.2
 
-this is the local corpus behind the release gate. generated binaries and IR are not committed because the largest fixture is 38 MB. corpus tests are marked `ignored` in a clean checkout, so a missing local corpus cannot be reported as a pass.
+tested on Windows x86-64 on 2026-11-24. the fixtures were protected with Amice built from tag `v0.1.6-beta.2` (`3fb1a97`) and LLVM 20.1.1. the devirtualizer read the generated IR and PE files without executing the protected programs.
+
+| check | result |
+| --- | --- |
+| Cargo and CI checks | 43 tests passed, 9 external corpus tests skipped. `cargo fmt -- --check`, Clippy with warnings denied, and the locked release build passed |
+| narrow strings | 16/16 CLI checks recovered the exact bytes of `hello` and `static gang`, including the terminator |
+| wide strings | 16/16 CLI checks recovered the exact UTF-16LE bytes of `WideΩ😀` and UTF-32LE bytes of `UTF32😀`, including their terminators |
+| simple and ruoke VMP | IR and PE instruction addresses within the VM function, opcodes, mnemonics and operand values matched for both producer tags. the simple fixture had 12 records and ruoke had 19 |
+| C with two profile groups | both descriptor guards passed and all 103 VM records matched across IR and PE. for the markerless IR run, the two descriptor seeds came from the PE report |
+| Rust and C++ | each markerless simple-profile fixture produced 12 matching VM records across IR and PE |
+| drag and drop | the single-path command recovered both groups and all 103 VM records with ruoke and the old simple package beside the executable |
+
+each string matrix covers both algorithms, four modes and both input formats. the normal Cargo suite includes the small `wide-simd.ll`, `wide-simd.exe` and `narrow-simd.exe` fixtures. the atomic instruction test uses the upstream bytecode encoder to exercise ordinary and volatile `fmaximumnum` and `fminimumnum`. the nine tests that require the external August corpus were skipped in this run.
+
+the Windows x64 release binary used for the CLI checks was built with `rustc 1.100.0` and is 4,615,168 bytes. SHA-256 `817977ad359c0031272eb2ff33c435f436179ffe0ba5bebc033cf069b6399969`.
+
+## 0.1.0 with Amice v0.1.5-beta.3
+
+the following results are from 2026-08-01 on Windows x86-64.
+
+the August corpus lives outside the repository. its largest fixture is 38 MB. the tests that depend on it are marked `ignored` in a clean checkout.
 
 ## toolchain
 
